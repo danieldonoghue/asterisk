@@ -82,7 +82,7 @@ static struct ast_taskpool *broadcast_taskpool;
 /*! \brief Broadcast context stored on channel */
 struct stasis_broadcast_ctx {
 	/*! The unique ID of the channel */
-	char channel_id[AST_MAX_EXTENSION];
+	char channel_id[AST_MAX_UNIQUEID];
 	/*! Name of the winning application */
 	char winner_app[AST_MAX_EXTENSION];
 	/*! Flag indicating if channel was claimed */
@@ -100,10 +100,20 @@ struct stasis_broadcast_ctx {
 /*! \brief Container for all active broadcast contexts */
 static struct ao2_container *broadcast_contexts;
 
-/*! \brief Destructor for broadcast datastore */
+/*! \brief Destructor for broadcast datastore
+ *
+ * Called when the channel is destroyed. Ensures the broadcast context
+ * is unlinked from the global container even if the caller never
+ * reached stasis_app_broadcast_cleanup (e.g. abnormal channel teardown).
+ */
 static void broadcast_datastore_destroy(void *data)
 {
-	ao2_cleanup(data);
+	struct stasis_broadcast_ctx *ctx = data;
+
+	if (broadcast_contexts) {
+		ao2_unlink(broadcast_contexts, ctx);
+	}
+	ao2_cleanup(ctx);
 }
 
 /*! \brief Datastore information for broadcast context */
@@ -423,7 +433,7 @@ static int validate_regex_pattern(const char *pattern)
 struct broadcast_task_data {
 	/*! Name of the app to send to (owned by this struct) */
 	char *app_name;
-	/*! Event JSON to send (referenced) */
+	/*! Event JSON to send (deep copy, owned by this struct) */
 	struct ast_json *event;
 };
 
@@ -584,12 +594,13 @@ static int send_broadcast_event(struct ast_channel *chan, const char *app_filter
 				continue;
 			}
 
-			/* Setup task data - owns app_name string and event reference */
+			/* Setup task data - owns app_name string and a deep copy of the event. */
 			task_data->app_name = ast_strdup(match_name);
-			task_data->event = ast_json_ref(event);
+			task_data->event = ast_json_deep_copy(event);
 
-			if (!task_data->app_name) {
-				ast_log(LOG_ERROR, "Failed to duplicate app name for '%s'\n", match_name);
+			if (!task_data->app_name || !task_data->event) {
+				ast_log(LOG_ERROR, "Failed to allocate broadcast task data for app '%s'\n", match_name);
+				ast_free(task_data->app_name);
 				ast_json_unref(task_data->event);
 				ast_free(task_data);
 				ao2_ref(match_name, -1);
@@ -745,13 +756,16 @@ int AST_OPTIONAL_API_NAME(stasis_app_claim_channel)(const char *channel_id, cons
 					"winner_app", app_name);
 
 				if (event) {
-					/* Send to all registered apps for informational purposes */
+					/* Send to all registered apps for informational purposes. */
 					apps = stasis_app_get_all();
 					if (apps) {
 						iter = ao2_iterator_init(apps, 0);
-						/* stasis_app_get_all() returns a string container, not stasis_app objects */
 						while ((app_name_iter = ao2_iterator_next(&iter))) {
-							stasis_app_send(app_name_iter, ast_json_ref(event));
+							struct ast_json *event_copy = ast_json_deep_copy(event);
+							if (event_copy) {
+								stasis_app_send(app_name_iter, event_copy);
+								ast_json_unref(event_copy);
+							}
 							ao2_ref(app_name_iter, -1);
 						}
 						ao2_iterator_destroy(&iter);
@@ -916,22 +930,26 @@ static int load_module(void)
 		return AST_MODULE_LOAD_DECLINE;
 	}
 
-	ast_log(LOG_NOTICE, "Stasis broadcast module loaded\n");
+	ast_debug(1, "Stasis broadcast module loaded\n");
 	return AST_MODULE_LOAD_SUCCESS;
 }
 
 static int unload_module(void)
 {
-	ao2_cleanup(broadcast_contexts);
-	broadcast_contexts = NULL;
-
-	/* Shutdown taskpool */
+	/*
+	 * Shutdown the taskpool first to prevent new tasks from being
+	 * pushed and allow in-flight broadcast_send_task callbacks to
+	 * drain before we tear down state they might reference.
+	 */
 	if (broadcast_taskpool) {
 		ast_taskpool_shutdown(broadcast_taskpool);
 		broadcast_taskpool = NULL;
 	}
 
-	ast_log(LOG_NOTICE, "Stasis broadcast module unloaded\n");
+	ao2_cleanup(broadcast_contexts);
+	broadcast_contexts = NULL;
+
+	ast_debug(1, "Stasis broadcast module unloaded\n");
 	return 0;
 }
 

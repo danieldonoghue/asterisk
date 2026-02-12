@@ -164,7 +164,7 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 		}
 	}
 
-	ast_log(LOG_NOTICE, "Broadcasting channel %s (timeout=%dms, filter=%s)\n",
+	ast_verb(3, "Broadcasting channel %s (timeout=%dms, filter=%s)\n",
 		ast_channel_name(chan), timeout_ms, app_filter ? app_filter : "none");
 
 	/* Start the broadcast */
@@ -180,7 +180,7 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 		/* Channel was claimed */
 		winner = stasis_app_broadcast_winner(ast_channel_uniqueid(chan));
 		if (winner) {
-			ast_log(LOG_NOTICE, "Channel %s claimed by %s\n",
+			ast_verb(3, "Channel %s claimed by %s\n",
 				ast_channel_name(chan), winner);
 			ast_channel_lock(chan);
 			pbx_builtin_setvar_helper(chan, "BROADCAST_WINNER", winner);
@@ -188,7 +188,7 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 			ast_free(winner);
 		}
 	} else {
-		ast_log(LOG_NOTICE, "Channel %s not claimed within timeout\n",
+		ast_verb(3, "Channel %s not claimed within timeout\n",
 			ast_channel_name(chan));
 	}
 
