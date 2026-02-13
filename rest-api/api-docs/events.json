@@ -1244,11 +1244,6 @@
 					"required": false,
 					"type": "string",
 					"description": "The called number."
-				},
-				"variables": {
-					"required": false,
-					"type": "object",
-					"description": "Channel variables that may be used for routing decisions."
 				}
 			}
 		},

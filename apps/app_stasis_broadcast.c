@@ -46,6 +46,11 @@
 				<para>Regular expression to filter which ARI applications
 				receive the broadcast. Only applications with names matching
 				the regex will be notified.</para>
+				<para>Because options are comma-delimited, commas cannot
+				appear in the regex pattern. Use character classes
+				(e.g. <literal>[,]</literal>) if a literal comma is
+				needed, or omit the filter and handle selection in the
+				ARI application.</para>
 				<para>Default: all connected applications</para>
 			</parameter>
 			<parameter name="args">
@@ -120,8 +125,6 @@
 
 #include "asterisk.h"
 
-#include <limits.h>
-
 #include "asterisk/app.h"
 #include "asterisk/module.h"
 #include "asterisk/pbx.h"
@@ -139,6 +142,9 @@ static const char *app = "StasisBroadcast";
 
 /*! \brief Maximum number of Stasis arguments */
 #define MAX_STASIS_ARGS 128
+
+/*! \brief Maximum number of comma-separated key=value options */
+#define MAX_OPTIONS 10
 
 /*! \brief StasisBroadcast dialplan application callback */
 static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
@@ -159,7 +165,7 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 	);
 
 	AST_DECLARE_APP_ARGS(options,
-		AST_APP_ARG(option)[10];
+		AST_APP_ARG(option)[MAX_OPTIONS];
 	);
 
 	ast_assert(chan != NULL);
@@ -210,7 +216,12 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 		}
 	}
 
-	/* Parse colon-delimited Stasis arguments */
+	/*
+	 * Parse colon-delimited Stasis arguments.  stasis_argv[] holds
+	 * pointers into the stack-allocated args_copy buffer.  This is
+	 * safe because stasis_app_exec is called within this same
+	 * function scope so the stack frame remains alive.
+	 */
 	if (!ast_strlen_zero(stasis_args_raw)) {
 		char *args_copy = ast_strdupa(stasis_args_raw);
 		char *arg;

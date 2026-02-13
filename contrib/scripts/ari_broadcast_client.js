@@ -91,7 +91,9 @@ function claimChannel(channelId, appName) {
 function shouldClaimCall(event) {
     const caller = event.caller;
     const called = event.called;
-    const variables = event.variables || {};
+    /* Channel variables configured in ari.conf "channelvars" are
+     * included in the channel snapshot, not at the event top level. */
+    const variables = (event.channel && event.channel.channelvars) || {};
 
     console.log('  Evaluating routing logic...');
     console.log(`    Caller: ${caller || 'N/A'}`);
@@ -116,7 +118,7 @@ function shouldClaimCall(event) {
         }
     }
 
-    // 3. Check for specific channel variables
+    // 3. Check for specific channel variables (requires channelvars in ari.conf)
     if (variables.SKILL_REQUIRED === 'advanced' && APP_NAME.includes('advanced')) {
         console.log('  ✓ Matches skill requirement');
         return true;

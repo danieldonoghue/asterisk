@@ -115,7 +115,9 @@ def should_claim_call(event: Dict[str, Any]) -> bool:
     """
     caller = event.get('caller', 'N/A')
     called = event.get('called', 'N/A')
-    variables = event.get('variables', {})
+    # Channel variables configured in ari.conf "channelvars" are
+    # included in the channel snapshot, not at the event top level.
+    variables = event.get('channel', {}).get('channelvars', {})
 
     logger.info('  Evaluating routing logic...')
     logger.info(f'    Caller: {caller}')
@@ -136,7 +138,7 @@ def should_claim_call(event: Dict[str, Any]) -> bool:
             logger.info('  ✓ Matches support criteria')
             return True
 
-    # 3. Check for specific channel variables
+    # 3. Check for specific channel variables (requires channelvars in ari.conf)
     if variables.get('SKILL_REQUIRED') == 'advanced' and 'advanced' in APP_NAME:
         logger.info('  ✓ Matches skill requirement')
         return True

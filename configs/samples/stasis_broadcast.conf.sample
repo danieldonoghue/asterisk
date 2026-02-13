@@ -1,0 +1,31 @@
+;
+; Stasis Broadcast Module Configuration (res_stasis_broadcast)
+;
+; Controls the taskpool used for parallel CallBroadcast and
+; CallClaimed event dispatch to ARI applications.
+;
+; If this file is absent, all values default to CPU-aware sizing
+; (see individual option descriptions below).
+;
+
+[taskpool]
+;minimum_size = 4          ; Minimum number of taskprocessors in the pool.
+;                          ; These threads are always kept alive.
+;                          ; Default: 4
+;initial_size = 4          ; Initial number of taskprocessors when the
+;                          ; module loads.  0 means no taskprocessors
+;                          ; until a task needs one.
+;                          ; Default: 4
+;idle_timeout_sec = 0      ; Seconds a taskprocessor can sit idle before
+;                          ; it is retired.  0 means taskprocessors never
+;                          ; time out.
+;                          ; Default: 0
+;max_size =                ; Maximum number of taskprocessors allowed.
+;                          ; 0 means no limit.  When unset the default is
+;                          ; the number of online CPUs (minimum 4).
+;                          ; Each broadcast task is CPU-bound, so more
+;                          ; threads than cores adds context-switch
+;                          ; overhead without improving throughput.
+;auto_increment = 2        ; Number of taskprocessors added each time the
+;                          ; pool grows to handle load.
+;                          ; Default: 2
