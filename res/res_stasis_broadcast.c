@@ -651,6 +651,10 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_channel)(struct ast_channel *chan
 
 	channel_id = ast_channel_uniqueid(chan);
 
+	if (!broadcast_contexts) {
+		return -1;
+	}
+
 	/* Remove any previous broadcast datastore from a prior attempt.
 	 * This supports failover scenarios where StasisBroadcast() is
 	 * called multiple times for the same channel.  The datastore
@@ -726,6 +730,10 @@ int AST_OPTIONAL_API_NAME(stasis_app_claim_channel)(const char *channel_id, cons
 	int result = -1;
 
 	if (ast_strlen_zero(channel_id) || ast_strlen_zero(app_name)) {
+		return -1;
+	}
+
+	if (!broadcast_contexts) {
 		return -1;
 	}
 
@@ -891,6 +899,11 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_wait)(struct ast_channel *chan, i
 	}
 
 	channel_id = ast_channel_uniqueid(chan);
+
+	if (!broadcast_contexts) {
+		return -1;
+	}
+
 	ctx = ao2_find(broadcast_contexts, channel_id, OBJ_SEARCH_KEY);
 	if (!ctx) {
 		ast_log(LOG_WARNING, "No broadcast context for channel %s\n", channel_id);
@@ -981,7 +994,7 @@ void AST_OPTIONAL_API_NAME(stasis_app_broadcast_cleanup)(const char *channel_id)
 {
 	RAII_VAR(struct stasis_broadcast_ctx *, ctx, NULL, ao2_cleanup);
 
-	if (ast_strlen_zero(channel_id)) {
+	if (ast_strlen_zero(channel_id) || !broadcast_contexts) {
 		return;
 	}
 
