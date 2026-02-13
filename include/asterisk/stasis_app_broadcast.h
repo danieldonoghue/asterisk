@@ -32,22 +32,31 @@
 #include "asterisk/channel.h"
 #include "asterisk/optional_api.h"
 
+/*! \brief Suppress CallClaimed event for this broadcast */
+#define STASIS_BROADCAST_FLAG_SUPPRESS_CLAIMED (1 << 0)
+
 /*!
  * \brief Start a broadcast for a channel
  *
  * Broadcasts a channel to all ARI applications (or filtered applications)
  * allowing them to claim the channel. Only the first claim will succeed.
  *
+ * When a channel is claimed, a CallClaimed event is sent only to applications
+ * that matched the \a app_filter (or all apps if no filter was set). This can
+ * be suppressed entirely with #STASIS_BROADCAST_FLAG_SUPPRESS_CLAIMED.
+ *
  * \param chan The channel to broadcast
  * \param timeout_ms Timeout in milliseconds to wait for a claim
  * \param app_filter Optional regex filter for application names (NULL for all)
+ * \param flags Combination of STASIS_BROADCAST_FLAG_* values
  *
  * \retval 0 on success
  * \retval -1 on error
  * \retval AST_OPTIONAL_API_UNAVAILABLE if res_stasis_broadcast is not loaded
  */
 AST_OPTIONAL_API(int, stasis_app_broadcast_channel,
-	(struct ast_channel *chan, int timeout_ms, const char *app_filter),
+	(struct ast_channel *chan, int timeout_ms, const char *app_filter,
+	unsigned int flags),
 	{ return AST_OPTIONAL_API_UNAVAILABLE; });
 
 /*!

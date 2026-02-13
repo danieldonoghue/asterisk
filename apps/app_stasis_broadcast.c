@@ -34,7 +34,8 @@
 		<since>
 			<version>21.0.0</version>
 		</since>
-		<synopsis>Broadcast a channel to multiple ARI applications for claiming.</synopsis>
+		<synopsis>Broadcast a channel to multiple ARI applications for claiming,
+		then hand control to the winning application.</synopsis>
 		<syntax>
 			<parameter name="timeout">
 				<para>Timeout in milliseconds to wait for a claim.</para>
@@ -47,36 +48,69 @@
 				the regex will be notified.</para>
 				<para>Default: all connected applications</para>
 			</parameter>
+			<parameter name="args">
+				<para>Optional colon-delimited arguments passed to the winning
+				application via the <literal>StasisStart</literal> event. These
+				are equivalent to the extra arguments in <literal>Stasis()</literal>.</para>
+				<para>Example: <literal>args=sales:priority-high</literal></para>
+			</parameter>
+			<parameter name="notify_claimed">
+				<para>Whether to send a <literal>CallClaimed</literal> event to
+				ARI applications when a channel is claimed.</para>
+				<para>When enabled, the <literal>CallClaimed</literal> event is
+				sent only to applications that matched the
+				<replaceable>app_filter</replaceable> (or all applications if no
+				filter was set).</para>
+				<para>Disabled by default to minimise WebSocket traffic under
+				high load. Losing claimants already receive a
+				<literal>409</literal> HTTP response.</para>
+				<para>Default: no</para>
+			</parameter>
 		</syntax>
 		<description>
 			<para>Broadcasts the incoming channel to all connected ARI applications
 			(or a filtered subset) via a <literal>CallBroadcast</literal> event.
 			ARI applications can respond with a claim request. The first application
 			to claim the channel wins, and subsequent claims are rejected.</para>
-			<para>After the timeout period, the channel variable
-			<variable>BROADCAST_WINNER</variable> will contain the name of the winning
-			application, or be empty if no application claimed the channel.</para>
-			<para>This application will set the following channel variable:</para>
+			<para>If an application claims the channel within the timeout, the channel
+			is automatically placed under Stasis control with the winning application,
+			exactly as if <literal>Stasis(winner_app)</literal> had been called.
+			The winning application receives a <literal>StasisStart</literal> event
+			and has full channel control until it calls <literal>continue</literal>
+			or the channel hangs up.</para>
+			<para>If no application claims the channel within the timeout, control
+			returns to the dialplan immediately, allowing fallback handling.</para>
+			<para>This application will set the following channel variables:</para>
 			<variablelist>
-				<variable name="BROADCAST_WINNER">
-					<para>The name of the ARI application that successfully claimed
-					the channel, or empty if no application claimed it within the
-					timeout period.</para>
+				<variable name="STASISSTATUS">
+					<value name="SUCCESS">
+						An application claimed the channel and the Stasis
+						session completed without failures.
+					</value>
+					<value name="FAILED">
+						An application claimed the channel but a failure
+						occurred when executing the Stasis application.
+					</value>
+					<value name="TIMEOUT">
+						No application claimed the channel within the
+						timeout period.
+					</value>
 				</variable>
 			</variablelist>
 			<example>
 			; Broadcast with default timeout (500ms) to all apps
+			; Channel automatically enters Stasis with the winner
 			exten => _X.,1,StasisBroadcast()
-			 same => n,GotoIf($["${BROADCAST_WINNER}"=""]?no_route)
-			 same => n,Stasis(${BROADCAST_WINNER})
+			 same => n,GotoIf($["${STASISSTATUS}"="TIMEOUT"]?no_route)
+			 same => n,Hangup()
 			 same => n(no_route),Playback(sorry-no-agent)
 			 same => n,Hangup()
 			</example>
 			<example>
-			; Broadcast with 1 second timeout to sales apps only
-			exten => _X.,1,StasisBroadcast(timeout=1000,app_filter=^sales_.*)
-			 same => n,GotoIf($["${BROADCAST_WINNER}"=""]?no_route)
-			 same => n,Stasis(${BROADCAST_WINNER})
+			; Broadcast with args passed to the winning application
+			exten => _X.,1,StasisBroadcast(timeout=2000,app_filter=^ivr-.*,args=sales:priority-high)
+			 same => n,GotoIf($["${STASISSTATUS}"="TIMEOUT"]?no_route)
+			 same => n,Hangup()
 			 same => n(no_route),Playback(sorry-no-agent)
 			 same => n,Hangup()
 			</example>
@@ -92,6 +126,7 @@
 #include "asterisk/module.h"
 #include "asterisk/pbx.h"
 #include "asterisk/stasis_app_broadcast.h"
+#include "asterisk/stasis_app_impl.h"
 
 /*! \brief Dialplan application name */
 static const char *app = "StasisBroadcast";
@@ -102,6 +137,9 @@ static const char *app = "StasisBroadcast";
 /*! \brief Maximum timeout in milliseconds */
 #define MAX_TIMEOUT_MS 60000
 
+/*! \brief Maximum number of Stasis arguments */
+#define MAX_STASIS_ARGS 128
+
 /*! \brief StasisBroadcast dialplan application callback */
 static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 {
@@ -109,8 +147,12 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 	char *options_str = NULL;
 	int timeout_ms = DEFAULT_TIMEOUT_MS;
 	const char *app_filter = NULL;
+	const char *stasis_args_raw = NULL;
+	unsigned int flags = STASIS_BROADCAST_FLAG_SUPPRESS_CLAIMED;
 	char *winner = NULL;
 	int result = 0;
+	int stasis_argc = 0;
+	char *stasis_argv[MAX_STASIS_ARGS];
 
 	AST_DECLARE_APP_ARGS(args,
 		AST_APP_ARG(options);
@@ -123,9 +165,7 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 	ast_assert(chan != NULL);
 
 	/* Initialize channel variable */
-	ast_channel_lock(chan);
-	pbx_builtin_setvar_helper(chan, "BROADCAST_WINNER", "");
-	ast_channel_unlock(chan);
+	pbx_builtin_setvar_helper(chan, "STASISSTATUS", "");
 
 	/* Parse arguments if provided */
 	if (!ast_strlen_zero(data)) {
@@ -156,6 +196,12 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 						}
 					} else if (!strcasecmp(key, "app_filter")) {
 						app_filter = val;
+					} else if (!strcasecmp(key, "args")) {
+						stasis_args_raw = val;
+					} else if (!strcasecmp(key, "notify_claimed")) {
+						if (ast_true(val)) {
+							flags &= ~STASIS_BROADCAST_FLAG_SUPPRESS_CLAIMED;
+						}
 					} else {
 						ast_log(LOG_WARNING, "Unknown option '%s'\n", key);
 					}
@@ -164,36 +210,61 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 		}
 	}
 
-	ast_verb(3, "Broadcasting channel %s (timeout=%dms, filter=%s)\n",
-		ast_channel_name(chan), timeout_ms, app_filter ? app_filter : "none");
+	/* Parse colon-delimited Stasis arguments */
+	if (!ast_strlen_zero(stasis_args_raw)) {
+		char *args_copy = ast_strdupa(stasis_args_raw);
+		char *arg;
+
+		while ((arg = strsep(&args_copy, ":")) != NULL && stasis_argc < MAX_STASIS_ARGS) {
+			stasis_argv[stasis_argc++] = arg;
+		}
+	}
+
+	ast_verb(3, "Broadcasting channel %s (timeout=%dms, filter=%s, args=%d)\n",
+		ast_channel_name(chan), timeout_ms, app_filter ? app_filter : "none",
+		stasis_argc);
 
 	/* Start the broadcast */
-	result = stasis_app_broadcast_channel(chan, timeout_ms, app_filter);
+	result = stasis_app_broadcast_channel(chan, timeout_ms, app_filter, flags);
 	if (result != 0) {
 		ast_log(LOG_ERROR, "Failed to broadcast channel %s (return code: %d)\n",
 			ast_channel_name(chan), result);
+		pbx_builtin_setvar_helper(chan, "STASISSTATUS", "FAILED");
 		return 0;
 	}
 
-	/* Wait for a claim */
-	if (stasis_app_broadcast_wait(chan, timeout_ms) == 0) {
-		/* Channel was claimed */
-		winner = stasis_app_broadcast_winner(ast_channel_uniqueid(chan));
-		if (winner) {
-			ast_verb(3, "Channel %s claimed by %s\n",
-				ast_channel_name(chan), winner);
-			ast_channel_lock(chan);
-			pbx_builtin_setvar_helper(chan, "BROADCAST_WINNER", winner);
-			ast_channel_unlock(chan);
-			ast_free(winner);
+	/* Wait for a claim.  A late claim can arrive between the timeout
+	 * expiring and our cleanup call, so always check for a winner
+	 * regardless of the wait result. */
+	stasis_app_broadcast_wait(chan, timeout_ms);
+	winner = stasis_app_broadcast_winner(ast_channel_uniqueid(chan));
+
+	/* Clean up broadcast context before entering Stasis */
+	stasis_app_broadcast_cleanup(ast_channel_uniqueid(chan));
+
+	if (winner) {
+		int ret;
+
+		ast_verb(3, "Channel %s claimed by %s, entering Stasis\n",
+			ast_channel_name(chan), winner);
+
+		/* Hand channel to the winning application, just like Stasis() does */
+		ret = stasis_app_exec(chan, winner, stasis_argc, stasis_argv);
+		ast_free(winner);
+
+		if (ret) {
+			pbx_builtin_setvar_helper(chan, "STASISSTATUS", "FAILED");
+			if (ast_check_hangup(chan)) {
+				return -1;
+			}
+		} else {
+			pbx_builtin_setvar_helper(chan, "STASISSTATUS", "SUCCESS");
 		}
 	} else {
 		ast_verb(3, "Channel %s not claimed within timeout\n",
 			ast_channel_name(chan));
+		pbx_builtin_setvar_helper(chan, "STASISSTATUS", "TIMEOUT");
 	}
-
-	/* Clean up broadcast context */
-	stasis_app_broadcast_cleanup(ast_channel_uniqueid(chan));
 
 	return 0;
 }

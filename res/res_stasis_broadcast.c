@@ -85,8 +85,12 @@ struct stasis_broadcast_ctx {
 	char channel_id[AST_MAX_UNIQUEID];
 	/*! Name of the winning application */
 	char winner_app[AST_MAX_EXTENSION];
+	/*! Regex pattern used to filter broadcast recipients */
+	char app_filter[MAX_REGEX_LENGTH + 1];
 	/*! Flag indicating if channel was claimed */
 	unsigned int claimed:1;
+	/*! Broadcast behaviour flags (STASIS_BROADCAST_FLAG_*) */
+	unsigned int flags;
 	/*! Lock for atomic claim operations */
 	ast_mutex_t lock;
 	/*! Condition variable for claim notification */
@@ -171,7 +175,8 @@ static void broadcast_ctx_destructor(void *obj)
 
 /*! \brief Create a new broadcast context */
 static struct stasis_broadcast_ctx *broadcast_ctx_create(
-	const char *channel_id, int timeout_ms)
+	const char *channel_id, int timeout_ms, const char *app_filter,
+	unsigned int flags)
 {
 	struct stasis_broadcast_ctx *ctx;
 
@@ -181,6 +186,12 @@ static struct stasis_broadcast_ctx *broadcast_ctx_create(
 	}
 
 	ast_copy_string(ctx->channel_id, channel_id, sizeof(ctx->channel_id));
+	if (!ast_strlen_zero(app_filter)) {
+		ast_copy_string(ctx->app_filter, app_filter, sizeof(ctx->app_filter));
+	} else {
+		ctx->app_filter[0] = '\0';
+	}
+	ctx->flags = flags;
 	ast_mutex_init(&ctx->lock);
 	ast_cond_init(&ctx->cond, NULL);
 	ctx->timeout_ms = timeout_ms;
@@ -188,8 +199,8 @@ static struct stasis_broadcast_ctx *broadcast_ctx_create(
 	ctx->winner_app[0] = '\0';
 	ctx->broadcast_time = ast_tvnow();
 
-	ast_debug(1, "Created broadcast context for channel %s (timeout: %dms)\n",
-		ctx->channel_id, ctx->timeout_ms);
+	ast_debug(1, "Created broadcast context for channel %s (timeout: %dms, flags: 0x%x)\n",
+		ctx->channel_id, ctx->timeout_ms, ctx->flags);
 
 	return ctx;
 }
@@ -215,10 +226,9 @@ static struct ast_json *collect_channel_vars(struct ast_channel *chan)
 
 			/*
 			 * Skip internal variables: those starting with '_' (inherited vars)
-			 * and '__' (globally inherited vars), plus function result variables
+			 * and '__' (globally inherited vars).
 			 */
-			if (name && name[0] != '_' && value &&
-				strcmp(name, "BROADCAST_WINNER") != 0) {
+			if (name && name[0] != '_' && value) {
 				struct ast_json *jstr = ast_json_string_create(value);
 				if (jstr) {
 					ast_json_object_set(vars, name, jstr);
@@ -486,14 +496,18 @@ static int send_broadcast_event(struct ast_channel *chan, const char *app_filter
 	/* Collect channel variables */
 	vars = collect_channel_vars(chan);
 
-	/* Build the broadcast event */
-	event = ast_json_pack("{s: s, s: o, s: o, s: s?, s: s?, s: o?}",
+	/* Build the broadcast event.
+	 * Use O? (borrow) for variables so ast_json_pack increments the
+	 * refcount itself.  This is safe on both the success and failure
+	 * paths — pack rolls back its incref on failure, so a single
+	 * ast_json_unref always balances our original reference. */
+	event = ast_json_pack("{s: s, s: o, s: o, s: s?, s: s?, s: O?}",
 		"type", "CallBroadcast",
 		"timestamp", ast_json_timeval(ast_tvnow(), NULL),
 		"channel", ast_channel_snapshot_to_json(snapshot, NULL),
 		"caller", caller,
 		"called", called,
-		"variables", ast_json_ref(vars));
+		"variables", vars);
 
 	if (!event) {
 		ast_log(LOG_ERROR, "Failed to create broadcast event\n");
@@ -501,7 +515,7 @@ static int send_broadcast_event(struct ast_channel *chan, const char *app_filter
 		return -1;
 	}
 
-	/* Release our original vars reference; event holds its own ref */
+	/* Release our original vars reference; event holds its own via O format */
 	ast_json_unref(vars);
 
 	/* Compile app filter regex if provided */
@@ -636,7 +650,7 @@ static int send_broadcast_event(struct ast_channel *chan, const char *app_filter
  * \return 0 on success, -1 on error
  */
 int AST_OPTIONAL_API_NAME(stasis_app_broadcast_channel)(struct ast_channel *chan, int timeout_ms,
-	const char *app_filter)
+	const char *app_filter, unsigned int flags)
 {
 	RAII_VAR(struct stasis_broadcast_ctx *, ctx, NULL, ao2_cleanup);
 	struct ast_datastore *datastore;
@@ -649,7 +663,7 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_channel)(struct ast_channel *chan
 	channel_id = ast_channel_uniqueid(chan);
 
 	/* Create broadcast context */
-	ctx = broadcast_ctx_create(channel_id, timeout_ms);
+	ctx = broadcast_ctx_create(channel_id, timeout_ms, app_filter, flags);
 	if (!ctx) {
 		ast_log(LOG_ERROR, "Failed to create broadcast context for %s\n", channel_id);
 		return -1;
@@ -738,15 +752,20 @@ int AST_OPTIONAL_API_NAME(stasis_app_claim_channel)(const char *channel_id, cons
 	}
 	ast_mutex_unlock(&ctx->lock);
 
-	/* If claim successful, set channel variable */
-	if (result == 0) {
+	/* If claim successful, send CallClaimed event to matching apps */
+	if (result == 0 && !(ctx->flags & STASIS_BROADCAST_FLAG_SUPPRESS_CLAIMED)) {
+		regex_t regex;
+		int regex_compiled = 0;
+
 		chan = ast_channel_get_by_name(channel_id);
 		if (chan) {
-			ast_channel_lock(chan);
-			pbx_builtin_setvar_helper(chan, "BROADCAST_WINNER", app_name);
-			ast_channel_unlock(chan);
+			/* Compile the stored app_filter for CallClaimed recipient filtering */
+			if (!ast_strlen_zero(ctx->app_filter)) {
+				if (regcomp(&regex, ctx->app_filter, REG_EXTENDED | REG_NOSUB) == 0) {
+					regex_compiled = 1;
+				}
+			}
 
-			/* Send CallClaimed event to all apps */
 			snapshot = ast_channel_snapshot_get_latest(channel_id);
 			if (snapshot) {
 				event = ast_json_pack("{s: s, s: o, s: o, s: s}",
@@ -756,12 +775,18 @@ int AST_OPTIONAL_API_NAME(stasis_app_claim_channel)(const char *channel_id, cons
 					"winner_app", app_name);
 
 				if (event) {
-					/* Send to all registered apps for informational purposes. */
 					apps = stasis_app_get_all();
 					if (apps) {
 						iter = ao2_iterator_init(apps, 0);
 						while ((app_name_iter = ao2_iterator_next(&iter))) {
-							struct ast_json *event_copy = ast_json_deep_copy(event);
+							struct ast_json *event_copy;
+
+							/* Only send to apps that matched the original broadcast filter */
+							if (regex_compiled && regexec(&regex, app_name_iter, 0, NULL, 0) == REG_NOMATCH) {
+								ao2_ref(app_name_iter, -1);
+								continue;
+							}
+							event_copy = ast_json_deep_copy(event);
 							if (event_copy) {
 								stasis_app_send(app_name_iter, event_copy);
 								ast_json_unref(event_copy);
@@ -771,6 +796,10 @@ int AST_OPTIONAL_API_NAME(stasis_app_claim_channel)(const char *channel_id, cons
 						ao2_iterator_destroy(&iter);
 					}
 				}
+			}
+
+			if (regex_compiled) {
+				regfree(&regex);
 			}
 		}
 	}
@@ -858,7 +887,7 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_wait)(struct ast_channel *chan, i
 	while (!ctx->claimed) {
 		int wait_result = ast_cond_timedwait(&ctx->cond, &ctx->lock, &timeout_spec);
 		if (wait_result == ETIMEDOUT) {
-			ast_log(LOG_NOTICE, "Broadcast timeout for channel %s after %dms\n",
+			ast_verb(3, "Broadcast timeout for channel %s after %dms\n",
 				channel_id, timeout_ms);
 			break;
 		} else if (wait_result != 0) {

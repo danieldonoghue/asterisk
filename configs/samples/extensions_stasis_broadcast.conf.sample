@@ -1,107 +1,88 @@
 ;
 ; Example Asterisk dialplan configuration for StasisBroadcast()
 ;
-; This file demonstrates how to use the StasisBroadcast() dialplan application
-; to broadcast incoming calls to multiple ARI applications and route to the winner.
+; StasisBroadcast() broadcasts a channel to all connected ARI applications
+; (or a filtered subset). The first application to claim the channel wins,
+; and the channel is automatically placed under Stasis control with that
+; application -- exactly as if Stasis(winner_app) had been called.
+;
+; If no application claims within the timeout, STASISSTATUS is set to
+; "TIMEOUT" and control returns to the dialplan for fallback handling.
+;
+; Channel variables set by StasisBroadcast():
+;   STASISSTATUS = SUCCESS | FAILED | TIMEOUT
+;
+; Options:
+;   timeout=<ms>           Claim timeout (default: 500, max: 60000)
+;   app_filter=<regex>     Only broadcast to matching app names
+;   args=<arg1:arg2:...>   Colon-delimited args passed to the winner
+;   notify_claimed=<yes|no> Send CallClaimed event (default: no)
 ;
 
 [general]
 
-; Basic broadcast context - broadcast to all ARI apps
+; Basic broadcast - broadcast to all ARI apps with default 500ms timeout
 [broadcast-basic]
 exten => _X.,1,NoOp(Incoming call from ${CALLERID(num)} to ${EXTEN})
  same => n,StasisBroadcast()
- same => n,GotoIf($["${BROADCAST_WINNER}"=""]?no_route)
- same => n,NoOp(Call claimed by ${BROADCAST_WINNER})
- same => n,Stasis(${BROADCAST_WINNER})
- same => n,Hangup()
- same => n(no_route),NoOp(No application claimed the call)
- same => n,Playback(sorry-no-agent-available)
- same => n,Hangup()
-
-; Broadcast with custom timeout (1 second)
-[broadcast-timeout]
-exten => _X.,1,NoOp(Incoming call with 1s timeout)
- same => n,StasisBroadcast(timeout=1000)
- same => n,GotoIf($["${BROADCAST_WINNER}"=""]?no_route)
- same => n,Stasis(${BROADCAST_WINNER})
+ same => n,GotoIf($["${STASISSTATUS}"="TIMEOUT"]?no_route)
  same => n,Hangup()
  same => n(no_route),Playback(sorry-no-agent-available)
  same => n,Hangup()
 
-; Broadcast only to sales applications
-[broadcast-sales]
+; Broadcast with custom timeout (2 seconds) and application filter
+[broadcast-filtered]
 exten => _X.,1,NoOp(Sales call routing)
- same => n,StasisBroadcast(timeout=500,app_filter=^sales_.*)
- same => n,GotoIf($["${BROADCAST_WINNER}"=""]?no_route)
- same => n,NoOp(Routed to sales app: ${BROADCAST_WINNER})
- same => n,Stasis(${BROADCAST_WINNER})
+ same => n,StasisBroadcast(timeout=2000,app_filter=^sales_.*)
+ same => n,GotoIf($["${STASISSTATUS}"="TIMEOUT"]?no_route)
  same => n,Hangup()
- same => n(no_route),NoOp(No sales agent available)
- same => n,Playback(sorry-sales-closed)
+ same => n(no_route),Playback(sorry-sales-closed)
  same => n,Hangup()
 
-; Broadcast only to support applications
-[broadcast-support]
-exten => _X.,1,NoOp(Support call routing)
- same => n,StasisBroadcast(timeout=2000,app_filter=^support_.*)
- same => n,GotoIf($["${BROADCAST_WINNER}"=""]?no_route)
- same => n,NoOp(Routed to support app: ${BROADCAST_WINNER})
- same => n,Stasis(${BROADCAST_WINNER})
+; Broadcast with arguments passed to the winning application
+; Args appear in the StasisStart event, just like Stasis(app,arg1,arg2)
+[broadcast-with-args]
+exten => _X.,1,NoOp(Support call with context args)
+ same => n,StasisBroadcast(timeout=2000,app_filter=^support_.*,args=tier1:english)
+ same => n,GotoIf($["${STASISSTATUS}"="TIMEOUT"]?no_route)
  same => n,Hangup()
- same => n(no_route),NoOp(No support agent available)
- same => n,Playback(sorry-support-unavailable)
+ same => n(no_route),Playback(sorry-support-unavailable)
  same => n,Hangup()
 
-; Advanced example with skill-based routing using channel variables
+; Skill-based routing using channel variables
+; ARI apps receive channel variables in the CallBroadcast event
+; and can decide whether to claim based on them
 [broadcast-skillbased]
 exten => _X.,1,NoOp(Skill-based routing)
  same => n,Set(CHANNEL(language)=en)
  same => n,Set(SKILL_REQUIRED=advanced)
  same => n,Set(PRIORITY=high)
  same => n,StasisBroadcast(timeout=3000,app_filter=^agent_.*)
- same => n,GotoIf($["${BROADCAST_WINNER}"=""]?no_route)
- same => n,NoOp(Matched agent: ${BROADCAST_WINNER})
- same => n,Stasis(${BROADCAST_WINNER})
+ same => n,GotoIf($["${STASISSTATUS}"="TIMEOUT"]?no_route)
  same => n,Hangup()
  same => n(no_route),NoOp(No qualified agent available)
  same => n,Playback(please-hold)
  same => n,Queue(default-queue)
  same => n,Hangup()
 
-; Example with fallback to traditional queue
+; Broadcast with CallClaimed notifications enabled for observability
+; Use notify_claimed=yes to have ARI apps receive a CallClaimed event
+; when a channel is claimed (disabled by default to reduce traffic)
+[broadcast-with-notify]
+exten => _X.,1,NoOp(Broadcast with claim notifications)
+ same => n,StasisBroadcast(timeout=500,app_filter=^agent_.*,notify_claimed=yes)
+ same => n,GotoIf($["${STASISSTATUS}"="TIMEOUT"]?no_route)
+ same => n,Hangup()
+ same => n(no_route),Playback(sorry-no-agent-available)
+ same => n,Hangup()
+
+; Fallback to traditional queue if no ARI app claims
 [broadcast-with-fallback]
 exten => _X.,1,NoOp(Broadcast with queue fallback)
  same => n,StasisBroadcast(timeout=500,app_filter=^premium_.*)
- same => n,GotoIf($["${BROADCAST_WINNER}"=""]?fallback)
- same => n,NoOp(Premium agent claimed: ${BROADCAST_WINNER})
- same => n,Stasis(${BROADCAST_WINNER})
+ same => n,GotoIf($["${STASISSTATUS}"="TIMEOUT"]?fallback)
  same => n,Hangup()
  same => n(fallback),NoOp(No premium agent, falling back to queue)
  same => n,Queue(default-queue,t,,,60)
  same => n,Playback(goodbye)
- same => n,Hangup()
-
-; Example for testing - broadcast to specific pattern
-[broadcast-test]
-exten => 1000,1,NoOp(Test broadcast to test_.* apps)
- same => n,StasisBroadcast(timeout=5000,app_filter=^test_.*)
- same => n,NoOp(Winner: ${BROADCAST_WINNER})
- same => n,GotoIf($["${BROADCAST_WINNER}"!=""]?claimed:unclaimed)
- same => n(claimed),Stasis(${BROADCAST_WINNER})
- same => n,Hangup()
- same => n(unclaimed),Playback(beep)
- same => n,Hangup()
-
-; Emergency routing - highest priority, longer timeout
-[broadcast-emergency]
-exten => 911,1,NoOp(Emergency call)
- same => n,Set(CHANNEL(priority)=emergency)
- same => n,StasisBroadcast(timeout=10000,app_filter=^emergency_.*)
- same => n,GotoIf($["${BROADCAST_WINNER}"=""]?fallback)
- same => n,NoOp(Emergency responder: ${BROADCAST_WINNER})
- same => n,Stasis(${BROADCAST_WINNER})
- same => n,Hangup()
- same => n(fallback),NoOp(No emergency responder - critical alert)
- same => n,Playback(emergency-no-response)
  same => n,Hangup()
