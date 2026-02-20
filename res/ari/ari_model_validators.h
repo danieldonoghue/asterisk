@@ -1759,7 +1759,6 @@ ari_validator ast_ari_validate_application_fn(void);
  * - called: string
  * - caller: string
  * - channel: Channel (required)
- * - variables: object
  * CallClaimed
  * - asterisk_id: string
  * - type: string (required)
