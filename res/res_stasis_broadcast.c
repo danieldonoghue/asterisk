@@ -37,6 +37,7 @@
 #include "asterisk/astobj2.h"
 #include "asterisk/channel.h"
 #include "asterisk/config.h"
+#include "asterisk/http.h"
 #include "asterisk/json.h"
 #include "asterisk/lock.h"
 #include "asterisk/module.h"
@@ -52,7 +53,6 @@
 
 #define AST_API_MODULE  /* Mark this as the module providing the API */
 #include "asterisk/stasis_app_broadcast.h"
-#include "asterisk/http.h"
 
 #define BROADCAST_BUCKETS 37
 
@@ -349,11 +349,13 @@ static int validate_regex_pattern(const char *pattern)
 			const char *q = p + 1;
 			long m = 0, n = -1; /* n=-1 means open upper bound */
 			int valid = 0;
+			int digit;
 			int overflow = 0;
+
 			if (*q >= '0' && *q <= '9') {
 				/* Parse m safely */
 				while (*q >= '0' && *q <= '9') {
-					int digit = (*q - '0');
+					digit = (*q - '0');
 					if (m > (LONG_MAX - digit) / 10) { /* overflow on next step */
 						overflow = 1;
 						break;
@@ -370,7 +372,7 @@ static int validate_regex_pattern(const char *pattern)
 					if (*q >= '0' && *q <= '9') {
 						long nn = 0;
 						while (*q >= '0' && *q <= '9') {
-							int digit = (*q - '0');
+							digit = (*q - '0');
 							if (nn > (LONG_MAX - digit) / 10) {
 								overflow = 1;
 								break;

@@ -29,10 +29,18 @@
 	<support_level>extended</support_level>
  ***/
 
+#include "asterisk.h"
+
+#include "asterisk/app.h"
+#include "asterisk/module.h"
+#include "asterisk/pbx.h"
+#include "asterisk/stasis_app_broadcast.h"
+#include "asterisk/stasis_app_impl.h"
+
 /*** DOCUMENTATION
 	<application name="StasisBroadcast" language="en_US">
 		<since>
-			<version>21.0.0</version>
+			<version>TBD</version>
 		</since>
 		<synopsis>Broadcast a channel to multiple ARI applications for claiming,
 		then hand control to the winning application.</synopsis>
@@ -122,14 +130,6 @@
 		</description>
 	</application>
  ***/
-
-#include "asterisk.h"
-
-#include "asterisk/app.h"
-#include "asterisk/module.h"
-#include "asterisk/pbx.h"
-#include "asterisk/stasis_app_broadcast.h"
-#include "asterisk/stasis_app_impl.h"
 
 /*! \brief Dialplan application name */
 static const char *app = "StasisBroadcast";
