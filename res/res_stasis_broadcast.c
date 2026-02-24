@@ -746,16 +746,19 @@ int AST_OPTIONAL_API_NAME(stasis_app_claim_channel)(const char *channel_id, cons
 		return -1;
 	}
 
-	/* Atomically check and set claimed flag */
+	/* Atomically check and set claimed flag.
+	 * Check claimed before finished: if the channel was claimed and then the
+	 * broadcast finished, a late claim should return -2 (409 Conflict) rather
+	 * than -1 (404) so callers can distinguish "already taken" from "not found". */
 	ast_mutex_lock(&ctx->lock);
-	if (ctx->finished) {
-		ast_debug(1, "Channel %s broadcast already finished (late claim by %s rejected)\n",
-			channel_id, app_name);
-		result = -1;
-	} else if (ctx->claimed) {
+	if (ctx->claimed) {
 		ast_debug(1, "Channel %s already claimed by %s (attempt by %s denied)\n",
 			channel_id, ctx->winner_app ? ctx->winner_app : "(unknown)", app_name);
 		result = -2;
+	} else if (ctx->finished) {
+		ast_debug(1, "Channel %s broadcast already finished (late claim by %s rejected)\n",
+			channel_id, app_name);
+		result = -1;
 	} else {
 		ctx->winner_app = ast_strdup(app_name);
 		if (!ctx->winner_app) {
