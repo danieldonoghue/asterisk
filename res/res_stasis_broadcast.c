@@ -1007,8 +1007,22 @@ void AST_OPTIONAL_API_NAME(stasis_app_broadcast_cleanup)(const char *channel_id)
 	}
 }
 
-/*! \brief Minimum number of taskpool threads */
-#define TASKPOOL_MIN_SIZE 4
+/*!
+ * \brief Default minimum/initial taskpool size.
+ *
+ * Zero means no threads are created during module load.  Worker threads are
+ * spawned on demand (in increments of #TASKPOOL_AUTO_INCREMENT) the first
+ * time a broadcast task is pushed.  Creating threads inside load_module causes
+ * a deadlock in the Asterisk module loader on some systems.
+ */
+#define TASKPOOL_MIN_SIZE 0
+
+/*! \brief Floor applied to the CPU-scaled max_size default.
+ *
+ * Even on single-core hosts the pool may grow to this many threads under
+ * burst load.  Unrelated to #TASKPOOL_MIN_SIZE.
+ */
+#define TASKPOOL_MAX_FLOOR 4
 
 /*! \brief Default auto_increment for the taskpool */
 #define TASKPOOL_AUTO_INCREMENT 2
@@ -1033,14 +1047,15 @@ static void load_taskpool_config(struct ast_taskpool_options *opts)
 	long num_cpus;
 
 	/*
-	 * Scale defaults to the hardware.  Each broadcast task is
+	 * Scale max_size to the hardware.  Each broadcast task is
 	 * CPU-bound (ao2 lookup, JSON mutation, enqueue) with no
 	 * I/O blocking, so more threads than cores just adds
-	 * context-switch overhead.
+	 * context-switch overhead.  Apply a floor so the pool can
+	 * still grow under burst load on single-core hosts.
 	 */
 	num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-	if (num_cpus < TASKPOOL_MIN_SIZE) {
-		num_cpus = TASKPOOL_MIN_SIZE;
+	if (num_cpus < TASKPOOL_MAX_FLOOR) {
+		num_cpus = TASKPOOL_MAX_FLOOR;
 	}
 
 	opts->version = AST_TASKPOOL_OPTIONS_VERSION;
