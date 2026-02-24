@@ -1108,7 +1108,7 @@ static void load_taskpool_config(struct ast_taskpool_options *opts)
 
 static int load_module(void)
 {
-	struct ast_taskpool_options taskpool_options;
+	struct ast_taskpool_options taskpool_options = { 0 };
 
 	load_taskpool_config(&taskpool_options);
 
