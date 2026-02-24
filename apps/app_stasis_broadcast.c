@@ -250,18 +250,20 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 	stasis_app_broadcast_wait(chan, timeout_ms);
 	winner = stasis_app_broadcast_winner(ast_channel_uniqueid(chan));
 
-	/* Clean up broadcast context before entering Stasis */
-	stasis_app_broadcast_cleanup(ast_channel_uniqueid(chan));
-
 	if (winner) {
 		int ret;
 
 		ast_verb(3, "Channel %s claimed by %s, entering Stasis\n",
 			ast_channel_name(chan), winner);
 
-		/* Hand channel to the winning application, just like Stasis() does */
+		/* Defer cleanup until after Stasis so concurrent claimants can still
+		 * find the context (with claimed=1) and receive 409 Conflict instead
+		 * of 404 Not Found. */
 		ret = stasis_app_exec(chan, winner, stasis_argc, stasis_argv);
 		ast_free(winner);
+
+		/* Clean up now that the Stasis session has ended */
+		stasis_app_broadcast_cleanup(ast_channel_uniqueid(chan));
 
 		if (ret) {
 			pbx_builtin_setvar_helper(chan, "STASISSTATUS", "FAILED");
@@ -272,6 +274,8 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 			pbx_builtin_setvar_helper(chan, "STASISSTATUS", "SUCCESS");
 		}
 	} else {
+		/* No winner: clean up immediately, nothing to race against */
+		stasis_app_broadcast_cleanup(ast_channel_uniqueid(chan));
 		ast_verb(3, "Channel %s not claimed within timeout\n",
 			ast_channel_name(chan));
 		pbx_builtin_setvar_helper(chan, "STASISSTATUS", "TIMEOUT");
