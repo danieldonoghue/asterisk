@@ -118,7 +118,9 @@
 				{
 					"httpMethod": "POST",
 					"since": [
-						"21.0.0"
+						"20.17.0",
+						"22.7.0",
+						"23.1.0"
 					],
 					"summary": "Claim a broadcast channel for this application.",
 					"notes": "Atomically claims a channel that is in broadcast state. Only the first claim succeeds.",

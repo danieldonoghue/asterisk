@@ -1,7 +1,7 @@
 /*
  * Asterisk -- An open source telephony toolkit.
  *
- * Copyright (C) 2025, Aurora Innovation AB
+ * Copyright (C) 2026, Aurora Innovation AB
  *
  * Daniel Donoghue <daniel.donoghue@aurorainnovation.com>
  *
@@ -38,7 +38,7 @@
 /*!
  * \brief Start a broadcast for a channel
  *
- * \since TBD
+ * \since 20
  *
  * Broadcasts a channel to all ARI applications (or filtered applications)
  * allowing them to claim the channel. Only the first claim will succeed.
@@ -64,7 +64,7 @@ AST_OPTIONAL_API(int, stasis_app_broadcast_channel,
 /*!
  * \brief Attempt to claim a broadcast channel
  *
- * \since TBD
+ * \since 20
  *
  * Atomically attempts to claim a channel that is in broadcast state.
  * Only the first claim for a given channel will succeed.
@@ -84,7 +84,7 @@ AST_OPTIONAL_API(int, stasis_app_claim_channel,
 /*!
  * \brief Get the winner app name for a broadcast channel
  *
- * \since TBD
+ * \since 20
  *
  * \param channel_id The unique ID of the channel
  *
@@ -99,7 +99,7 @@ AST_OPTIONAL_API(char *, stasis_app_broadcast_winner,
 /*!
  * \brief Wait for a broadcast channel to be claimed
  *
- * \since TBD
+ * \since 20
  *
  * Blocks until the channel is claimed or the timeout expires.
  *
@@ -117,7 +117,7 @@ AST_OPTIONAL_API(int, stasis_app_broadcast_wait,
 /*!
  * \brief Clean up broadcast context for a channel
  *
- * \since TBD
+ * \since 20
  *
  * Removes the broadcast context when the channel is done or leaving the
  * broadcast state.

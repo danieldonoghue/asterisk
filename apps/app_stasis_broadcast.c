@@ -1,7 +1,7 @@
 /*
  * Asterisk -- An open source telephony toolkit.
  *
- * Copyright (C) 2025, Aurora Innovation AB
+ * Copyright (C) 2026, Aurora Innovation AB
  *
  * Daniel Donoghue <daniel.donoghue@aurorainnovation.com>
  *
@@ -40,7 +40,9 @@
 /*** DOCUMENTATION
 	<application name="StasisBroadcast" language="en_US">
 		<since>
-			<version>TBD</version>
+			<version>20.17.0</version>
+			<version>22.7.0</version>
+			<version>23.1.0</version>
 		</since>
 		<synopsis>Broadcast a channel to multiple ARI applications for claiming,
 		then hand control to the winning application.</synopsis>
@@ -54,7 +56,7 @@
 				<para>Regular expression to filter which ARI applications
 				receive the broadcast. Only applications with names matching
 				the regex will be notified.</para>
-				<para>Because options are comma-delimited, commas cannot
+				<para>Because arguments are comma-delimited, commas cannot
 				appear in the regex pattern. Use character classes
 				(e.g. <literal>[,]</literal>) if a literal comma is
 				needed, or omit the filter and handle selection in the
@@ -65,7 +67,7 @@
 				<para>Optional colon-delimited arguments passed to the winning
 				application via the <literal>StasisStart</literal> event. These
 				are equivalent to the extra arguments in <literal>Stasis()</literal>.</para>
-				<para>Example: <literal>args=sales:priority-high</literal></para>
+				<para>Example: <literal>sales:priority-high</literal></para>
 			</parameter>
 			<parameter name="notify_claimed">
 				<para>Whether to send a <literal>CallClaimed</literal> event to
@@ -120,8 +122,8 @@
 			 same => n,Hangup()
 			</example>
 			<example>
-			; Broadcast with args passed to the winning application
-			exten => _X.,1,StasisBroadcast(timeout=2000,app_filter=^ivr-.*,args=sales:priority-high)
+			; Broadcast with custom timeout, app filter, and args for the winner
+			exten => _X.,1,StasisBroadcast(2000,^ivr-.*,sales:priority-high)
 			 same => n,GotoIf($["${STASISSTATUS}"="TIMEOUT"]?no_route)
 			 same => n,Hangup()
 			 same => n(no_route),Playback(sorry-no-agent)
@@ -143,14 +145,10 @@ static const char *app = "StasisBroadcast";
 /*! \brief Maximum number of Stasis arguments */
 #define MAX_STASIS_ARGS 128
 
-/*! \brief Maximum number of comma-separated key=value options */
-#define MAX_OPTIONS 10
-
 /*! \brief StasisBroadcast dialplan application callback */
 static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 {
 	char *parse = NULL;
-	char *options_str = NULL;
 	int timeout_ms = DEFAULT_TIMEOUT_MS;
 	const char *app_filter = NULL;
 	const char *stasis_args_raw = NULL;
@@ -161,11 +159,10 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 	char *stasis_argv[MAX_STASIS_ARGS];
 
 	AST_DECLARE_APP_ARGS(args,
-		AST_APP_ARG(options);
-	);
-
-	AST_DECLARE_APP_ARGS(options,
-		AST_APP_ARG(option)[MAX_OPTIONS];
+		AST_APP_ARG(timeout);
+		AST_APP_ARG(app_filter);
+		AST_APP_ARG(stasis_args);
+		AST_APP_ARG(notify_claimed);
 	);
 
 	ast_assert(chan != NULL);
@@ -173,46 +170,31 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 	/* Initialize channel variable */
 	pbx_builtin_setvar_helper(chan, "STASISSTATUS", "");
 
-	/* Parse arguments if provided */
+	/* Parse positional arguments if provided */
 	if (!ast_strlen_zero(data)) {
 		parse = ast_strdupa(data);
 		AST_STANDARD_APP_ARGS(args, parse);
 
-		if (!ast_strlen_zero(args.options)) {
-			int i;
-			options_str = ast_strdupa(args.options);
-			AST_STANDARD_APP_ARGS(options, options_str);
-
-			/* Parse key=value options */
-			for (i = 0; i < options.argc; i++) {
-				char *key = options.option[i];
-				char *val = strchr(key, '=');
-
-				if (val) {
-					*val++ = '\0';
-					ast_strip(key);
-					ast_strip(val);
-
-					if (!strcasecmp(key, "timeout")) {
-						if (sscanf(val, "%d", &timeout_ms) != 1 || timeout_ms < 0 || timeout_ms > MAX_TIMEOUT_MS) {
-							ast_log(LOG_WARNING,
-								"Invalid timeout value '%s' (must be 0-%dms), using default %dms\n",
-								val, MAX_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
-							timeout_ms = DEFAULT_TIMEOUT_MS;
-						}
-					} else if (!strcasecmp(key, "app_filter")) {
-						app_filter = val;
-					} else if (!strcasecmp(key, "args")) {
-						stasis_args_raw = val;
-					} else if (!strcasecmp(key, "notify_claimed")) {
-						if (ast_true(val)) {
-							flags &= ~STASIS_BROADCAST_FLAG_SUPPRESS_CLAIMED;
-						}
-					} else {
-						ast_log(LOG_WARNING, "Unknown option '%s'\n", key);
-					}
-				}
+		if (!ast_strlen_zero(args.timeout)) {
+			if (sscanf(args.timeout, "%d", &timeout_ms) != 1
+				|| timeout_ms < 0 || timeout_ms > MAX_TIMEOUT_MS) {
+				ast_log(LOG_WARNING,
+					"Channel %s: invalid timeout value '%s' (must be 0-%dms), using default %dms\n",
+					ast_channel_name(chan), args.timeout, MAX_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+				timeout_ms = DEFAULT_TIMEOUT_MS;
 			}
+		}
+
+		if (!ast_strlen_zero(args.app_filter)) {
+			app_filter = args.app_filter;
+		}
+
+		if (!ast_strlen_zero(args.stasis_args)) {
+			stasis_args_raw = args.stasis_args;
+		}
+
+		if (!ast_strlen_zero(args.notify_claimed) && ast_true(args.notify_claimed)) {
+			flags &= ~STASIS_BROADCAST_FLAG_SUPPRESS_CLAIMED;
 		}
 	}
 
@@ -231,15 +213,16 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 		}
 	}
 
-	ast_verb(3, "Broadcasting channel %s (timeout=%dms, filter=%s, args=%d)\n",
+	ast_debug(3, "Broadcasting channel %s (timeout=%dms, filter=%s, args=%d)\n",
 		ast_channel_name(chan), timeout_ms, app_filter ? app_filter : "none",
 		stasis_argc);
 
 	/* Start the broadcast */
 	result = stasis_app_broadcast_channel(chan, timeout_ms, app_filter, flags);
-	if (result != 0) {
-		ast_log(LOG_ERROR, "Failed to broadcast channel %s (return code: %d)\n",
-			ast_channel_name(chan), result);
+	if (result) {
+		ast_log(LOG_ERROR, "Failed to broadcast channel %s: %s\n",
+			ast_channel_name(chan),
+			result == AST_OPTIONAL_API_UNAVAILABLE ? "res_stasis_broadcast not loaded" : "internal error");
 		pbx_builtin_setvar_helper(chan, "STASISSTATUS", "FAILED");
 		return 0;
 	}
@@ -253,7 +236,7 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 	if (winner) {
 		int ret;
 
-		ast_verb(3, "Channel %s claimed by %s, entering Stasis\n",
+		ast_debug(3, "Channel %s claimed by %s, entering Stasis\n",
 			ast_channel_name(chan), winner);
 
 		/* Defer cleanup until after Stasis so concurrent claimants can still
@@ -276,8 +259,8 @@ static int stasis_broadcast_exec(struct ast_channel *chan, const char *data)
 	} else {
 		/* No winner: clean up immediately, nothing to race against */
 		stasis_app_broadcast_cleanup(ast_channel_uniqueid(chan));
-		ast_verb(3, "Channel %s not claimed within timeout\n",
-			ast_channel_name(chan));
+		ast_log(LOG_WARNING, "Channel %s: not claimed within %dms timeout\n",
+			ast_channel_name(chan), timeout_ms);
 		pbx_builtin_setvar_helper(chan, "STASISSTATUS", "TIMEOUT");
 	}
 

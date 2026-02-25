@@ -1,7 +1,7 @@
 /*
  * Asterisk -- An open source telephony toolkit.
  *
- * Copyright (C) 2025, Aurora Innovation AB
+ * Copyright (C) 2026, Aurora Innovation AB
  *
  * Daniel Donoghue <daniel.donoghue@aurorainnovation.com>
  *
@@ -36,7 +36,6 @@
 
 #include "asterisk/astobj2.h"
 #include "asterisk/channel.h"
-#include "asterisk/config.h"
 #include "asterisk/http.h"
 #include "asterisk/json.h"
 #include "asterisk/lock.h"
@@ -86,7 +85,7 @@ static struct ast_taskpool *broadcast_taskpool;
 /*! \brief Broadcast context stored on channel */
 struct stasis_broadcast_ctx {
 	/*! The unique ID of the channel */
-	char channel_id[AST_MAX_UNIQUEID];
+	char channel_id[AST_MAX_PUBLIC_UNIQUEID];
 	/*! Name of the winning application (dynamically allocated, NULL until claimed) */
 	char *winner_app;
 	/*! Regex pattern used to filter broadcast recipients */
@@ -103,8 +102,6 @@ struct stasis_broadcast_ctx {
 	unsigned int flags;
 	/*! Reference to the global container (prevents use-after-free during module unload) */
 	struct ao2_container *container;
-	/*! Lock for atomic claim operations */
-	ast_mutex_t lock;
 	/*! Condition variable for claim notification */
 	ast_cond_t cond;
 };
@@ -134,44 +131,8 @@ static const struct ast_datastore_info broadcast_datastore_info = {
 	.destroy = broadcast_datastore_destroy,
 };
 
-/*! \brief Hash function for broadcast context container */
-static int broadcast_ctx_hash_fn(const void *obj, const int flags)
-{
-	const struct stasis_broadcast_ctx *ctx;
-	const char *key;
-
-	switch (flags & OBJ_SEARCH_MASK) {
-	case OBJ_SEARCH_KEY:
-		key = obj;
-		return ast_str_hash(key);
-	case OBJ_SEARCH_OBJECT:
-		ctx = obj;
-		return ast_str_hash(ctx->channel_id);
-	default:
-		ast_assert(0);
-		return 0;
-	}
-}
-
-/*! \brief Compare function for broadcast context container */
-static int broadcast_ctx_cmp_fn(void *obj, void *arg, int flags)
-{
-	const struct stasis_broadcast_ctx *ctx1 = obj;
-	const struct stasis_broadcast_ctx *ctx2 = arg;
-	const char *key = arg;
-
-	switch (flags & OBJ_SEARCH_MASK) {
-	case OBJ_SEARCH_OBJECT:
-		return strcmp(ctx1->channel_id, ctx2->channel_id) ? 0 : CMP_MATCH;
-	case OBJ_SEARCH_KEY:
-		return strcmp(ctx1->channel_id, key) ? 0 : CMP_MATCH;
-	case OBJ_SEARCH_PARTIAL_KEY:
-		return strncmp(ctx1->channel_id, key, strlen(key)) ? 0 : CMP_MATCH;
-	default:
-		ast_assert(0);
-		return 0;
-	}
-}
+AO2_STRING_FIELD_HASH_FN(stasis_broadcast_ctx, channel_id)
+AO2_STRING_FIELD_CMP_FN(stasis_broadcast_ctx, channel_id)
 
 /*! \brief Destructor for broadcast context */
 static void broadcast_ctx_destructor(void *obj)
@@ -183,7 +144,6 @@ static void broadcast_ctx_destructor(void *obj)
 	}
 	ao2_cleanup(ctx->container);
 	ast_cond_destroy(&ctx->cond);
-	ast_mutex_destroy(&ctx->lock);
 }
 
 static int validate_regex_pattern(const char *pattern);
@@ -204,14 +164,10 @@ static struct stasis_broadcast_ctx *broadcast_ctx_create(
 		return NULL;
 	}
 
+	/* ao2_alloc zeroes the struct; only set non-zero fields explicitly */
 	ast_copy_string(ctx->channel_id, channel_id, sizeof(ctx->channel_id));
 	ctx->flags = flags;
-	ctx->claimed = 0;
-	ctx->finished = 0;
-	ctx->filter_compiled = 0;
-	ctx->winner_app = NULL;
 	ctx->container = ao2_bump(broadcast_contexts);
-	ast_mutex_init(&ctx->lock);
 	ast_cond_init(&ctx->cond, NULL);
 
 	/* Validate and compile app_filter regex if provided */
@@ -219,19 +175,21 @@ static struct stasis_broadcast_ctx *broadcast_ctx_create(
 		ast_copy_string(ctx->app_filter, app_filter, sizeof(ctx->app_filter));
 		if (validate_regex_pattern(app_filter) != 0) {
 			ast_log(LOG_WARNING,
-				"Rejecting app_filter regex as potentially dangerous: %s\n",
-				app_filter);
+				"Channel %s: rejecting app_filter regex as potentially dangerous: %s\n",
+				channel_id, app_filter);
 		} else if (regcomp(&ctx->compiled_filter, app_filter,
 				REG_EXTENDED | REG_NOSUB) != 0) {
 			ast_log(LOG_WARNING,
-				"Failed to compile app_filter regex: %s\n", app_filter);
+				"Channel %s: failed to compile app_filter regex '%s'\n",
+				channel_id, app_filter);
 		} else {
 			ctx->filter_compiled = 1;
 		}
 
 		if (!ctx->filter_compiled) {
 			ast_log(LOG_WARNING,
-				"Proceeding without application filtering due to invalid regex\n");
+				"Channel %s: proceeding without application filtering due to invalid regex\n",
+				channel_id);
 		}
 	} else {
 		ctx->app_filter[0] = '\0';
@@ -271,7 +229,7 @@ static int validate_regex_pattern(const char *pattern)
 	/* Check maximum length to prevent excessive regex compilation time */
 	len = strlen(pattern);
 	if (len > MAX_REGEX_LENGTH) {
-		ast_log(LOG_WARNING, "Regex pattern exceeds maximum length of %d characters (got %zu)\n",
+		ast_debug(3, "Regex pattern exceeds maximum length of %d characters (got %zu)\n",
 			MAX_REGEX_LENGTH, len);
 		return -1;
 	}
@@ -319,7 +277,7 @@ static int validate_regex_pattern(const char *pattern)
 		case '(':
 			group_depth++;
 			if (group_depth > MAX_GROUP_DEPTH) {
-				ast_log(LOG_WARNING, "Regex pattern has too many nested groups (max %d)\n",
+				ast_debug(3, "Regex pattern has too many nested groups (max %d)\n",
 					MAX_GROUP_DEPTH);
 				return -1;
 			}
@@ -396,13 +354,13 @@ static int validate_regex_pattern(const char *pattern)
 				}
 			}
 			if (overflow) {
-				ast_log(LOG_WARNING, "Regex quantifier overflow or exceeds max bound (max %d)\n", MAX_QUANTIFIER_BOUND);
+				ast_debug(3, "Regex quantifier overflow or exceeds max bound (max %d)\n", MAX_QUANTIFIER_BOUND);
 				return -1;
 			}
 			if (valid) {
 				/* Additional bounds check (defensive) */
 				if (m > MAX_QUANTIFIER_BOUND || (n != -1 && n > MAX_QUANTIFIER_BOUND)) {
-					ast_log(LOG_WARNING, "Regex quantifier bounds too large (max %d)\n", MAX_QUANTIFIER_BOUND);
+					ast_debug(3, "Regex quantifier bounds too large (max %d)\n", MAX_QUANTIFIER_BOUND);
 					return -1;
 				}
 				if (p > pattern && *(p - 1) == ')') {
@@ -417,7 +375,7 @@ static int validate_regex_pattern(const char *pattern)
 				alternations_per_depth[group_depth]++;
 				if (group_depth > ALTERNATION_DEPTH_THRESHOLD &&
 					alternations_per_depth[group_depth] > MAX_ALTERNATIONS) {
-					ast_log(LOG_WARNING,
+					ast_debug(3,
 						"Regex has too many alternations in deep group (depth %d, count %d, max %d)\n",
 						group_depth,
 						alternations_per_depth[group_depth],
@@ -447,7 +405,7 @@ static int validate_regex_pattern(const char *pattern)
 	 * exploited for denial of service.
 	 */
 	if (quantified_groups > MAX_NESTED_QUANTIFIERS) {
-		ast_log(LOG_WARNING, "Regex pattern has too many quantified groups (max %d)\n",
+		ast_debug(3, "Regex pattern has too many quantified groups (max %d)\n",
 			MAX_NESTED_QUANTIFIERS);
 		return -1;
 	}
@@ -475,8 +433,7 @@ static int broadcast_send_task(void *data)
 	/* Send the message to the app */
 	stasis_app_send(task_data->app_name, task_data->event);
 
-	/* Cleanup */
-	ast_free(task_data->app_name);
+	/* app_name is allocated inline after the struct; freeing task_data covers it */
 	ast_json_unref(task_data->event);
 	ast_free(task_data);
 
@@ -500,14 +457,9 @@ static int send_broadcast_event(struct ast_channel *chan,
 	const char *caller = NULL;
 	const char *called = NULL;
 
-	snapshot = ast_channel_snapshot_get_latest(ast_channel_uniqueid(chan));
-	if (!snapshot) {
-		ast_log(LOG_ERROR, "Failed to get channel snapshot\n");
-		return -1;
-	}
-
-	/* Get caller and called info - duplicate strings while locked */
+	/* Get snapshot and caller/called info under a single channel lock */
 	ast_channel_lock(chan);
+	snapshot = ao2_bump(ast_channel_snapshot(chan));
 	caller = ast_strdupa(S_OR(ast_channel_caller(chan)->id.number.str, ""));
 	called = ast_strdupa(S_OR(ast_channel_exten(chan), ""));
 	ast_channel_unlock(chan);
@@ -523,14 +475,16 @@ static int send_broadcast_event(struct ast_channel *chan,
 		"called", called);
 
 	if (!event) {
-		ast_log(LOG_ERROR, "Failed to create broadcast event\n");
+		ast_log(LOG_ERROR, "Channel %s: failed to create broadcast event\n",
+			ast_channel_name(chan));
 		return -1;
 	}
 
 	/* Get all registered applications */
 	apps = stasis_app_get_all();
 	if (!apps) {
-		ast_log(LOG_ERROR, "Failed to get stasis applications\n");
+		ast_log(LOG_ERROR, "Channel %s: failed to get stasis applications\n",
+			ast_channel_name(chan));
 		return -1;
 	}
 
@@ -538,77 +492,90 @@ static int send_broadcast_event(struct ast_channel *chan,
 		ao2_container_count(apps));
 
 	/*
-	 * Broadcast to all matching applications in parallel to ensure fair
-	 * race conditions for claim operations. We collect all matching apps
-	 * first, then send to all simultaneously to avoid giving the first
-	 * app in the iterator an unfair time advantage.
+	 * Broadcast to all matching applications in parallel.
+	 *
+	 * We collect matching apps into a plain array, Fisher-Yates shuffle it,
+	 * then dispatch each app via the taskpool.  The shuffle ensures no single
+	 * ARI application is consistently first to receive the event — every app
+	 * gets a fair chance to claim the channel regardless of its position in
+	 * the ao2 hash container.
 	 */
 	{
-		struct ao2_container *matching_apps;
-		struct ao2_iterator match_iter;
-		char *match_name;
+		int app_count;
+		char **matching_arr;
+		int n = 0;
+		int i;
 
-		/* Create temporary container for matching apps */
-		matching_apps = ao2_container_alloc_list(AO2_ALLOC_OPT_LOCK_NOLOCK, 0, NULL, NULL);
-		if (!matching_apps) {
-			ast_log(LOG_ERROR, "Failed to allocate container for matching apps\n");
+		app_count = ao2_container_count(apps);
+		if (app_count == 0) {
+			ast_debug(2, "Channel %s: no Stasis applications registered\n",
+				ast_channel_uniqueid(chan));
+			return 0;
+		}
+
+		matching_arr = ast_malloc(app_count * sizeof(*matching_arr));
+		if (!matching_arr) {
+			ast_log(LOG_ERROR, "Channel %s: failed to allocate matching apps array\n",
+				ast_channel_name(chan));
 			return -1;
 		}
 
-		/* First pass: collect all matching app names */
+		/* First pass: collect all matching app names (transfer refs to array) */
 		iter = ao2_iterator_init(apps, 0);
-		while ((app_name = ao2_iterator_next(&iter))) {
-			/* Apply cached regex filter if compiled */
-			if (ctx->filter_compiled) {
-				if (regexec(&ctx->compiled_filter, app_name, 0, NULL, 0) == REG_NOMATCH) {
-					ast_debug(3, "App '%s' does not match filter, skipping\n", app_name);
-					ao2_ref(app_name, -1);
-					continue;
-				}
+		while ((app_name = ao2_iterator_next(&iter)) && n < app_count) {
+			if (ctx->filter_compiled &&
+				regexec(&ctx->compiled_filter, app_name, 0, NULL, 0) == REG_NOMATCH) {
+				ast_debug(3, "App '%s' does not match filter, skipping\n", app_name);
+				ao2_ref(app_name, -1);
+				continue;
 			}
-
-			/* Add to matching apps (will bump refcount) */
-			ao2_link(matching_apps, app_name);
-			ao2_ref(app_name, -1);
+			matching_arr[n++] = app_name; /* ref transferred to array */
 		}
 		ao2_iterator_destroy(&iter);
 
 		ast_debug(2, "Broadcasting channel %s to %d matching applications\n",
-			ast_channel_uniqueid(chan), ao2_container_count(matching_apps));
+			ast_channel_uniqueid(chan), n);
+
+		/* Fisher-Yates shuffle: randomise delivery order so no app is
+		 * consistently first to receive the broadcast event. */
+		for (i = n - 1; i > 0; i--) {
+			int j = ast_random() % (i + 1);
+			char *tmp = matching_arr[i];
+			matching_arr[i] = matching_arr[j];
+			matching_arr[j] = tmp;
+		}
 
 		/*
 		 * Second pass: dispatch to all matching apps in parallel via taskpool.
-		 * This ensures fair race conditions by having each stasis_app_send call
-		 * execute concurrently on different threads, giving all apps equal
-		 * opportunity to claim the channel.
+		 * Deep copies of the event JSON are mandatory because stasis_app_send()
+		 * mutates the message in-place (adds "asterisk_id" via
+		 * ast_json_object_set); sharing a refcounted copy across concurrent
+		 * tasks would cause data corruption.
 		 */
-		match_iter = ao2_iterator_init(matching_apps, 0);
-		while ((match_name = ao2_iterator_next(&match_iter))) {
+		for (i = 0; i < n; i++) {
+			char *match_name = matching_arr[i];
 			struct broadcast_task_data *task_data;
 
 			ast_debug(3, "Queueing broadcast to app '%s'\n", match_name);
 
-			task_data = ast_malloc(sizeof(*task_data));
+			/* Allocate task_data with app_name inline to avoid a second allocation */
+			task_data = ast_malloc(sizeof(*task_data) + strlen(match_name) + 1);
 			if (!task_data) {
-				ast_log(LOG_ERROR, "Failed to allocate broadcast task data for app '%s'\n", match_name);
+				ast_log(LOG_ERROR,
+					"Channel %s: failed to allocate task data for app '%s'\n",
+					ast_channel_uniqueid(chan), match_name);
 				ao2_ref(match_name, -1);
 				continue;
 			}
 
-			/*
-			 * Setup task data with deep copies.  Deep copy of the event
-			 * JSON is mandatory because stasis_app_send() mutates the
-			 * message in-place (adds "asterisk_id" via
-			 * ast_json_object_set); sharing a refcounted copy across
-			 * concurrent tasks would cause data corruption.
-			 */
-			task_data->app_name = ast_strdup(match_name);
+			task_data->app_name = (char *)(task_data + 1);
+			strcpy(task_data->app_name, match_name);
 			task_data->event = ast_json_deep_copy(event);
 
-			if (!task_data->app_name || !task_data->event) {
-				ast_log(LOG_ERROR, "Failed to allocate broadcast task data for app '%s'\n", match_name);
-				ast_free(task_data->app_name);
-				ast_json_unref(task_data->event);
+			if (!task_data->event) {
+				ast_log(LOG_ERROR,
+					"Channel %s: failed to deep-copy event for app '%s'\n",
+					ast_channel_uniqueid(chan), match_name);
 				ast_free(task_data);
 				ao2_ref(match_name, -1);
 				continue;
@@ -617,8 +584,9 @@ static int send_broadcast_event(struct ast_channel *chan,
 			ast_module_ref(ast_module_info->self);
 			if (!broadcast_taskpool
 				|| ast_taskpool_push(broadcast_taskpool, broadcast_send_task, task_data)) {
-				ast_log(LOG_ERROR, "Failed to push broadcast task for app '%s'\n", match_name);
-				ast_free(task_data->app_name);
+				ast_log(LOG_ERROR,
+					"Channel %s: failed to push broadcast task for app '%s'\n",
+					ast_channel_uniqueid(chan), match_name);
 				ast_json_unref(task_data->event);
 				ast_free(task_data);
 				ast_module_unref(ast_module_info->self);
@@ -626,8 +594,8 @@ static int send_broadcast_event(struct ast_channel *chan,
 
 			ao2_ref(match_name, -1);
 		}
-		ao2_iterator_destroy(&match_iter);
-		ao2_ref(matching_apps, -1);
+
+		ast_free(matching_arr);
 	}
 
 	return 0;
@@ -677,7 +645,7 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_channel)(struct ast_channel *chan
 	/* Create broadcast context (validates and compiles app_filter regex) */
 	ctx = broadcast_ctx_create(channel_id, app_filter, flags);
 	if (!ctx) {
-		ast_log(LOG_ERROR, "Failed to create broadcast context for %s\n", channel_id);
+		ast_log(LOG_ERROR, "Channel %s: failed to create broadcast context\n", channel_id);
 		return -1;
 	}
 
@@ -687,7 +655,7 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_channel)(struct ast_channel *chan
 	/* Create and attach datastore to channel */
 	datastore = ast_datastore_alloc(&broadcast_datastore_info, channel_id);
 	if (!datastore) {
-		ast_log(LOG_ERROR, "Failed to allocate datastore for %s\n", channel_id);
+		ast_log(LOG_ERROR, "Channel %s: failed to allocate broadcast datastore\n", channel_id);
 		ao2_unlink(broadcast_contexts, ctx);
 		return -1;
 	}
@@ -696,7 +664,7 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_channel)(struct ast_channel *chan
 	ast_channel_lock(chan);
 	if (ast_channel_datastore_add(chan, datastore)) {
 		ast_channel_unlock(chan);
-		ast_log(LOG_ERROR, "Failed to add datastore for %s\n", channel_id);
+		ast_log(LOG_ERROR, "Channel %s: failed to attach broadcast datastore\n", channel_id);
 		ast_datastore_free(datastore);
 		ao2_unlink(broadcast_contexts, ctx);
 		return -1;
@@ -708,7 +676,7 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_channel)(struct ast_channel *chan
 
 	/* Send broadcast event to all matching applications */
 	if (send_broadcast_event(chan, ctx) != 0) {
-		ast_log(LOG_ERROR, "Failed to send broadcast event for %s\n", channel_id);
+		ast_log(LOG_ERROR, "Channel %s: failed to send broadcast event\n", channel_id);
 		ast_channel_lock(chan);
 		ast_channel_datastore_remove(chan, datastore);
 		ast_channel_unlock(chan);
@@ -729,7 +697,6 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_channel)(struct ast_channel *chan
 int AST_OPTIONAL_API_NAME(stasis_app_claim_channel)(const char *channel_id, const char *app_name)
 {
 	RAII_VAR(struct stasis_broadcast_ctx *, ctx, NULL, ao2_cleanup);
-	int result = -1;
 
 	if (ast_strlen_zero(channel_id) || ast_strlen_zero(app_name)) {
 		return -1;
@@ -750,34 +717,36 @@ int AST_OPTIONAL_API_NAME(stasis_app_claim_channel)(const char *channel_id, cons
 	 * Check claimed before finished: if the channel was claimed and then the
 	 * broadcast finished, a late claim should return -2 (409 Conflict) rather
 	 * than -1 (404) so callers can distinguish "already taken" from "not found". */
-	ast_mutex_lock(&ctx->lock);
+	ao2_lock(ctx);
 	if (ctx->claimed) {
 		ast_debug(1, "Channel %s already claimed by %s (attempt by %s denied)\n",
 			channel_id, ctx->winner_app ? ctx->winner_app : "(unknown)", app_name);
-		result = -2;
-	} else if (ctx->finished) {
+		ao2_unlock(ctx);
+		return -2;
+	}
+	if (ctx->finished) {
 		ast_debug(1, "Channel %s broadcast already finished (late claim by %s rejected)\n",
 			channel_id, app_name);
-		result = -1;
-	} else {
-		ctx->winner_app = ast_strdup(app_name);
-		if (!ctx->winner_app) {
-			ast_log(LOG_ERROR,
-				"Failed to allocate winner app name for channel %s\n",
-				channel_id);
-		} else {
-			ctx->claimed = 1;
-			result = 0;
-			ast_verb(3, "Channel %s claimed by application %s\n",
-				channel_id, app_name);
-			/* Signal waiting thread that channel was claimed */
-			ast_cond_signal(&ctx->cond);
-		}
+		ao2_unlock(ctx);
+		return -1;
 	}
-	ast_mutex_unlock(&ctx->lock);
+	ctx->winner_app = ast_strdup(app_name);
+	if (!ctx->winner_app) {
+		ast_log(LOG_ERROR,
+			"Failed to allocate winner app name for channel %s\n",
+			channel_id);
+		ao2_unlock(ctx);
+		return -1;
+	}
+	ctx->claimed = 1;
+	ast_verb(3, "Channel %s claimed by application %s\n",
+		channel_id, app_name);
+	/* Signal waiting thread that channel was claimed */
+	ast_cond_signal(&ctx->cond);
+	ao2_unlock(ctx);
 
-	/* If claim successful, send CallClaimed event to matching apps via taskpool */
-	if (result == 0 && !(ctx->flags & STASIS_BROADCAST_FLAG_SUPPRESS_CLAIMED)) {
+	/* Send CallClaimed event to matching apps via taskpool */
+	if (!(ctx->flags & STASIS_BROADCAST_FLAG_SUPPRESS_CLAIMED)) {
 		RAII_VAR(struct ast_channel_snapshot *, snapshot, NULL, ao2_cleanup);
 		RAII_VAR(struct ast_json *, event, NULL, ast_json_unref);
 		RAII_VAR(struct ao2_container *, apps, NULL, ao2_cleanup);
@@ -808,18 +777,17 @@ int AST_OPTIONAL_API_NAME(stasis_app_claim_channel)(const char *channel_id, cons
 					continue;
 				}
 
-				task_data = ast_malloc(sizeof(*task_data));
+				task_data = ast_malloc(sizeof(*task_data) + strlen(app_name_iter) + 1);
 				if (!task_data) {
 					ao2_ref(app_name_iter, -1);
 					continue;
 				}
 
-				task_data->app_name = ast_strdup(app_name_iter);
+				task_data->app_name = (char *)(task_data + 1);
+				strcpy(task_data->app_name, app_name_iter);
 				task_data->event = ast_json_deep_copy(event);
 
-				if (!task_data->app_name || !task_data->event) {
-					ast_free(task_data->app_name);
-					ast_json_unref(task_data->event);
+				if (!task_data->event) {
 					ast_free(task_data);
 					ao2_ref(app_name_iter, -1);
 					continue;
@@ -830,9 +798,8 @@ int AST_OPTIONAL_API_NAME(stasis_app_claim_channel)(const char *channel_id, cons
 						|| ast_taskpool_push(broadcast_taskpool,
 							broadcast_send_task, task_data)) {
 					ast_log(LOG_ERROR,
-						"Failed to push CallClaimed task for app '%s'\n",
-						app_name_iter);
-					ast_free(task_data->app_name);
+						"Channel %s: failed to push CallClaimed task for app '%s'\n",
+						channel_id, app_name_iter);
 					ast_json_unref(task_data->event);
 					ast_free(task_data);
 					ast_module_unref(ast_module_info->self);
@@ -844,7 +811,7 @@ int AST_OPTIONAL_API_NAME(stasis_app_claim_channel)(const char *channel_id, cons
 		}
 	}
 
-	return result;
+	return 0;
 }
 
 /*!
@@ -867,7 +834,7 @@ char *AST_OPTIONAL_API_NAME(stasis_app_broadcast_winner)(const char *channel_id)
 		return NULL;
 	}
 
-	ast_mutex_lock(&ctx->lock);
+	ao2_lock(ctx);
 	if (ctx->claimed) {
 		winner = ast_strdup(ctx->winner_app);
 	}
@@ -875,7 +842,7 @@ char *AST_OPTIONAL_API_NAME(stasis_app_broadcast_winner)(const char *channel_id)
 	 * This closes the race window between reading the winner and
 	 * the subsequent broadcast_cleanup call. */
 	ctx->finished = 1;
-	ast_mutex_unlock(&ctx->lock);
+	ao2_unlock(ctx);
 
 	return winner;
 }
@@ -926,7 +893,7 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_wait)(struct ast_channel *chan, i
 	deadline = ast_tvadd(ast_tvnow(),
 		ast_tv(timeout_ms / 1000, (timeout_ms % 1000) * 1000));
 
-	ast_mutex_lock(&ctx->lock);
+	ao2_lock(ctx);
 	while (!ctx->claimed) {
 		struct timeval now;
 		struct timespec poll_spec;
@@ -936,7 +903,7 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_wait)(struct ast_channel *chan, i
 
 		/* Check for hangup so we don't block on a dead channel */
 		if (ast_check_hangup(chan)) {
-			ast_verb(3, "Channel %s hung up during broadcast wait\n",
+			ast_debug(3, "Channel %s hung up during broadcast wait\n",
 				channel_id);
 			break;
 		}
@@ -945,7 +912,7 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_wait)(struct ast_channel *chan, i
 		now = ast_tvnow();
 		remaining_ms = ast_tvdiff_ms(deadline, now);
 		if (remaining_ms <= 0) {
-			ast_verb(3, "Broadcast timeout for channel %s after %dms\n",
+			ast_debug(3, "Broadcast timeout for channel %s after %dms\n",
 				channel_id, timeout_ms);
 			break;
 		}
@@ -964,11 +931,11 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_wait)(struct ast_channel *chan, i
 			poll_spec.tv_nsec -= 1000000000;
 		}
 
-		wait_result = ast_cond_timedwait(&ctx->cond, &ctx->lock, &poll_spec);
+		wait_result = ast_cond_timedwait(&ctx->cond, ao2_object_get_lockaddr(ctx), &poll_spec);
 		if (wait_result != 0 && wait_result != ETIMEDOUT) {
 			ast_log(LOG_WARNING,
-				"Unexpected error waiting for claim on channel %s: %d\n",
-				channel_id, wait_result);
+				"Channel %s: unexpected error waiting for claim: %s (%d)\n",
+				channel_id, strerror(wait_result), wait_result);
 			break;
 		}
 		/* Loop back: re-check claimed, then hangup, then deadline */
@@ -979,7 +946,7 @@ int AST_OPTIONAL_API_NAME(stasis_app_broadcast_wait)(struct ast_channel *chan, i
 			channel_id, ctx->winner_app);
 		result = 0;
 	}
-	ast_mutex_unlock(&ctx->lock);
+	ao2_unlock(ctx);
 
 	return result;
 }
@@ -1003,117 +970,50 @@ void AST_OPTIONAL_API_NAME(stasis_app_broadcast_cleanup)(const char *channel_id)
 		return;
 	}
 
-	ctx = ao2_find(broadcast_contexts, channel_id, OBJ_SEARCH_KEY);
+	ctx = ao2_find(broadcast_contexts, channel_id, OBJ_SEARCH_KEY | OBJ_UNLINK);
 	if (ctx) {
 		ast_debug(3, "Cleaning up broadcast context for %s\n", channel_id);
-		ao2_unlink(broadcast_contexts, ctx);
 	}
 }
 
-/*!
- * \brief Default minimum/initial taskpool size.
+/*! \brief Minimum taskpool size on single-core hosts.
  *
- * Zero means no threads are created during module load.  Worker threads are
- * spawned on demand (in increments of #TASKPOOL_AUTO_INCREMENT) the first
- * time a broadcast task is pushed.  Creating threads inside load_module causes
- * a deadlock in the Asterisk module loader on some systems.
+ * Broadcast fan-out is I/O-bound (WebSocket writes), so a deployment with
+ * many ARI applications benefits from concurrent dispatch slots even on
+ * low-core hosts.
  */
-#define TASKPOOL_MIN_SIZE 0
-
-/*! \brief Floor applied to the CPU-scaled max_size default.
- *
- * Even on single-core hosts the pool may grow to this many threads under
- * burst load.  Unrelated to #TASKPOOL_MIN_SIZE.
- */
-#define TASKPOOL_MAX_FLOOR 4
-
-/*! \brief Default auto_increment for the taskpool */
-#define TASKPOOL_AUTO_INCREMENT 2
-
-/*! \brief Configuration file for this module */
-#define BROADCAST_CONFIG_FILE "stasis_broadcast.conf"
-
-/*!
- * \brief Load taskpool configuration from stasis_broadcast.conf
- *
- * Populates \a opts with CPU-aware defaults, then overrides any
- * values found in the [taskpool] section of #BROADCAST_CONFIG_FILE.
- * If the file is absent or invalid the defaults are used unchanged.
- *
- * \param opts Taskpool options struct to populate
- */
-static void load_taskpool_config(struct ast_taskpool_options *opts)
-{
-	struct ast_config *cfg;
-	struct ast_flags config_flags = { 0 };
-	const char *val;
-	long num_cpus;
-
-	/*
-	 * Scale max_size to the hardware.  Each broadcast task is
-	 * CPU-bound (ao2 lookup, JSON mutation, enqueue) with no
-	 * I/O blocking, so more threads than cores just adds
-	 * context-switch overhead.  Apply a floor so the pool can
-	 * still grow under burst load on single-core hosts.
-	 */
-	num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-	if (num_cpus < TASKPOOL_MAX_FLOOR) {
-		num_cpus = TASKPOOL_MAX_FLOOR;
-	}
-
-	opts->version = AST_TASKPOOL_OPTIONS_VERSION;
-	opts->selector = AST_TASKPOOL_SELECTOR_DEFAULT;
-	opts->idle_timeout = 0;
-	opts->auto_increment = TASKPOOL_AUTO_INCREMENT;
-	opts->minimum_size = TASKPOOL_MIN_SIZE;
-	opts->initial_size = TASKPOOL_MIN_SIZE;
-	opts->max_size = num_cpus;
-
-	cfg = ast_config_load(BROADCAST_CONFIG_FILE, config_flags);
-	if (!cfg || cfg == CONFIG_STATUS_FILEINVALID
-			|| cfg == CONFIG_STATUS_FILEMISSING) {
-		return;
-	}
-
-	if ((val = ast_variable_retrieve(cfg, "taskpool", "initial_size"))) {
-		int v;
-		if (sscanf(val, "%d", &v) == 1 && v >= 0) {
-			opts->initial_size = v;
-		}
-	}
-	if ((val = ast_variable_retrieve(cfg, "taskpool", "minimum_size"))) {
-		int v;
-		if (sscanf(val, "%d", &v) == 1 && v >= 0) {
-			opts->minimum_size = v;
-		}
-	}
-	if ((val = ast_variable_retrieve(cfg, "taskpool", "max_size"))) {
-		int v;
-		if (sscanf(val, "%d", &v) == 1 && v >= 0) {
-			opts->max_size = v;
-		}
-	}
-	if ((val = ast_variable_retrieve(cfg, "taskpool", "idle_timeout_sec"))) {
-		int v;
-		if (sscanf(val, "%d", &v) == 1 && v >= 0) {
-			opts->idle_timeout = v;
-		}
-	}
-	if ((val = ast_variable_retrieve(cfg, "taskpool", "auto_increment"))) {
-		int v;
-		if (sscanf(val, "%d", &v) == 1 && v >= 0) {
-			opts->auto_increment = v;
-		}
-	}
-
-	ast_config_destroy(cfg);
-}
+#define TASKPOOL_SIZE_FLOOR 4
 
 static int load_module(void)
 {
-	struct ast_taskpool_options taskpool_options = { 0 };
+	long num_cpus;
+	struct ast_taskpool_options taskpool_options;
 
-	load_taskpool_config(&taskpool_options);
+	/*
+	 * Pre-warm a fixed pool sized to the number of online CPUs (floored at
+	 * TASKPOOL_SIZE_FLOOR).  Setting initial_size = minimum_size = max_size
+	 * with auto_increment = 0 creates a fixed pool whose processors are
+	 * ready immediately — no growth threshold to cross before tasks dispatch
+	 * in parallel.  idle_timeout = 0 keeps all processors alive for the
+	 * lifetime of the module.
+	 *
+	 * Broadcast tasks are I/O-bound (JSON deep-copy then WebSocket enqueue),
+	 * so a pool sized to nproc gives good concurrency without excess
+	 * context-switch overhead on larger hosts.  As an optional module,
+	 * these threads only exist on systems that load res_stasis_broadcast.
+	 */
+	num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+	if (num_cpus < TASKPOOL_SIZE_FLOOR) {
+		num_cpus = TASKPOOL_SIZE_FLOOR;
+	}
+
+	taskpool_options.version        = AST_TASKPOOL_OPTIONS_VERSION;
+	taskpool_options.selector       = AST_TASKPOOL_SELECTOR_DEFAULT;
+	taskpool_options.minimum_size   = (int)num_cpus;  /* always-present processors */
+	taskpool_options.initial_size   = (int)num_cpus;  /* pre-warm at load          */
+	taskpool_options.auto_increment = 0;              /* fixed size, no growth     */
+	taskpool_options.idle_timeout   = 0;              /* keep warm while loaded    */
+	taskpool_options.max_size       = (int)num_cpus;  /* hard ceiling              */
 
 	/* Create taskpool for parallel broadcast dispatch */
 	broadcast_taskpool = ast_taskpool_create("stasis_broadcast", &taskpool_options);
@@ -1123,7 +1023,7 @@ static int load_module(void)
 	}
 
 	broadcast_contexts = ao2_container_alloc_hash(AO2_ALLOC_OPT_LOCK_MUTEX, 0,
-		BROADCAST_BUCKETS, broadcast_ctx_hash_fn, NULL, broadcast_ctx_cmp_fn);
+		BROADCAST_BUCKETS, stasis_broadcast_ctx_hash_fn, NULL, stasis_broadcast_ctx_cmp_fn);
 
 	if (!broadcast_contexts) {
 		ast_taskpool_shutdown(broadcast_taskpool);
