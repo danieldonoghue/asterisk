@@ -976,31 +976,35 @@ void AST_OPTIONAL_API_NAME(stasis_app_broadcast_cleanup)(const char *channel_id)
 	}
 }
 
-/*! \brief Minimum taskpool size on single-core hosts.
+/*! \brief Floor applied to the CPU-scaled max_size.
  *
- * Broadcast fan-out is I/O-bound (WebSocket writes), so a deployment with
- * many ARI applications benefits from concurrent dispatch slots even on
- * low-core hosts.
+ * Ensures the pool can grow to at least this many threads on single-core
+ * hosts under burst load.
  */
 #define TASKPOOL_SIZE_FLOOR 4
 
 static int load_module(void)
 {
 	long num_cpus;
-	struct ast_taskpool_options taskpool_options;
+	struct ast_taskpool_options taskpool_options = { 0 };
 
 	/*
-	 * Pre-warm a fixed pool sized to the number of online CPUs (floored at
-	 * TASKPOOL_SIZE_FLOOR).  Setting initial_size = minimum_size = max_size
-	 * with auto_increment = 0 creates a fixed pool whose processors are
-	 * ready immediately — no growth threshold to cross before tasks dispatch
-	 * in parallel.  idle_timeout = 0 keeps all processors alive for the
-	 * lifetime of the module.
-	 *
+	 * Scale to the number of online CPUs (floored at TASKPOOL_SIZE_FLOOR).
 	 * Broadcast tasks are I/O-bound (JSON deep-copy then WebSocket enqueue),
 	 * so a pool sized to nproc gives good concurrency without excess
-	 * context-switch overhead on larger hosts.  As an optional module,
-	 * these threads only exist on systems that load res_stasis_broadcast.
+	 * context-switch overhead on larger hosts.
+	 *
+	 * initial_size and minimum_size are both 0: spawning threads inside
+	 * load_module deadlocks the Asterisk module loader.
+	 *
+	 * auto_increment is set to nproc so that on the first broadcast push the
+	 * pool grows to its full size in one step.  From that point on all nproc
+	 * processors are available for parallel dispatch; subsequent broadcasts
+	 * never queue more than one task per processor.
+	 *
+	 * idle_timeout of 0 keeps threads alive for the module lifetime, avoiding
+	 * repeated pthread_create/join overhead.  As an optional module, threads
+	 * only exist on systems that load res_stasis_broadcast.
 	 */
 	num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
 	if (num_cpus < TASKPOOL_SIZE_FLOOR) {
@@ -1009,11 +1013,11 @@ static int load_module(void)
 
 	taskpool_options.version        = AST_TASKPOOL_OPTIONS_VERSION;
 	taskpool_options.selector       = AST_TASKPOOL_SELECTOR_DEFAULT;
-	taskpool_options.minimum_size   = (int)num_cpus;  /* always-present processors */
-	taskpool_options.initial_size   = (int)num_cpus;  /* pre-warm at load          */
-	taskpool_options.auto_increment = 0;              /* fixed size, no growth     */
-	taskpool_options.idle_timeout   = 0;              /* keep warm while loaded    */
-	taskpool_options.max_size       = (int)num_cpus;  /* hard ceiling              */
+	taskpool_options.minimum_size   = 0;              /* no threads at load time   */
+	taskpool_options.initial_size   = 0;              /* no threads at load time   */
+	taskpool_options.auto_increment = (int)num_cpus;  /* grow to full size at once */
+	taskpool_options.idle_timeout   = 0;              /* keep threads once spawned */
+	taskpool_options.max_size       = (int)num_cpus;  /* cap at nproc              */
 
 	/* Create taskpool for parallel broadcast dispatch */
 	broadcast_taskpool = ast_taskpool_create("stasis_broadcast", &taskpool_options);
