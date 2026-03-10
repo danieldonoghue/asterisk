@@ -3248,6 +3248,10 @@ struct ast_sip_session *ast_sip_session_create_outgoing(struct ast_sip_endpoint 
 	SCOPE_ENTER(1, "%s %s Topology: %s\n", ast_sorcery_object_get_id(endpoint), request_user,
 		ast_str_tmp(256, ast_stream_topology_to_str(req_topology, &STR_TMP)));
 
+	if (ast_sip_session_check_supplement_create(endpoint, request_user)) {
+		SCOPE_EXIT_RTN_VALUE(NULL, "Session creation blocked by supplement\n");
+	}
+
 	/* If no location has been provided use the AOR list from the endpoint itself */
 	if (location || !contact) {
 		location = S_OR(location, endpoint->aors);

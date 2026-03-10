@@ -314,6 +314,26 @@ struct ast_sip_session_supplement {
 	 */
 	void (*session_destroy)(struct ast_sip_session *session);
 	/*!
+	 * \brief Called before an outgoing session is created
+	 *
+	 * This is called before the session dialog is created and can be used to
+	 * block the creation of the session entirely.  A non-zero return value
+	 * prevents the session from being created.  The callback is called from
+	 * the global supplement list, not per-session, so the session does not
+	 * yet exist when this is called.
+	 *
+	 * \since 20.19.0
+	 * \since 22.9.0
+	 * \since 23.3.0
+	 *
+	 * \param endpoint The endpoint the outgoing session would be created for
+	 * \param destination The request user (user part of the Request-URI), or NULL
+	 *
+	 * \retval non-zero Block session creation
+	 * \retval 0 Allow session creation
+	 */
+	int (*session_create)(struct ast_sip_endpoint *endpoint, const char *destination);
+	/*!
 	 * \brief Called on incoming SIP request
 	 * This method can indicate a failure in processing in its return. If there
 	 * is a failure, it is required that this method sends a response to the request.
@@ -624,6 +644,29 @@ void ast_sip_session_register_supplement_with_module(struct ast_module *module, 
  * \param supplement The supplement to unregister
  */
 void ast_sip_session_unregister_supplement(struct ast_sip_session_supplement *supplement);
+
+/*!
+ * \brief Check registered supplements for permission to create an outgoing session
+ *
+ * Iterates the global supplement list and calls any registered \c session_create
+ * callbacks.  The first callback to return a non-zero value stops the iteration
+ * and causes this function to return -1, blocking the session creation.
+ *
+ * This is called at the beginning of ast_sip_session_create_outgoing() before
+ * any dialog or invite session resources are allocated.
+ *
+ * \since 20.19.0
+ * \since 22.9.0
+ * \since 23.3.0
+ *
+ * \param endpoint The endpoint the outgoing session would be created for
+ * \param destination The request user (user part of the Request-URI), or NULL
+ *
+ * \retval 0 Session creation is allowed
+ * \retval -1 Session creation is blocked by a supplement
+ */
+int ast_sip_session_check_supplement_create(struct ast_sip_endpoint *endpoint,
+	const char *destination);
 
 /*!
  * \brief Add supplements to a SIP session

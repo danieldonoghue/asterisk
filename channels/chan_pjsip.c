@@ -2621,6 +2621,7 @@ struct request_data {
 	struct ast_sip_session *session;
 	struct ast_stream_topology *topology;
 	const char *dest;
+	const struct ast_channel *requestor;
 	int cause;
 };
 
@@ -2741,6 +2742,7 @@ static struct ast_channel *chan_pjsip_request_with_stream_topology(const char *t
 
 	req_data.topology = topology;
 	req_data.dest = data;
+	req_data.requestor = requestor;
 	/* Default failure value in case ast_sip_push_task_wait_servant() itself fails. */
 	req_data.cause = AST_CAUSE_FAILURE;
 
